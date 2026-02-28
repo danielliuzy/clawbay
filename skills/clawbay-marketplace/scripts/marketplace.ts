@@ -1,4 +1,12 @@
+import { WebSocket } from "ws";
+// @ts-ignore – polyfill for nostr-tools relay connections in Node.js
+globalThis.WebSocket = WebSocket as any;
+
+import { finalizeEvent } from "nostr-tools/pure";
+import { SimplePool } from "nostr-tools/pool";
+import { hexToBytes } from "@noble/hashes/utils";
 import { ethers } from "ethers";
+import * as crypto from "crypto";
 import * as dotenv from "dotenv";
 import * as path from "path";
 
@@ -6,33 +14,148 @@ import * as path from "path";
 dotenv.config({ path: path.join(__dirname, "..", ".env") });
 dotenv.config({ path: path.join(__dirname, "..", "..", "..", ".env") });
 
-const SERVER_URL = process.env.CLAWBAY_SERVER_URL || "http://localhost:3838";
 const RPC_URL = process.env.GOAT_RPC_URL || "https://rpc.testnet3.goat.network";
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
 const CONTRACT_ADDRESS = process.env.ESCROW_CONTRACT_ADDRESS;
+
+const DEFAULT_RELAYS = ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.nostr.band"];
+const RELAYS = process.env.NOSTR_RELAYS ? process.env.NOSTR_RELAYS.split(",").map((r) => r.trim()) : DEFAULT_RELAYS;
+
+const KIND_CLASSIFIED = 30402;
+const CLAWBAY_TAG = "clawbay";
 
 const ESCROW_ABI = [
   "function createEscrow(address seller, string calldata description) external payable returns (uint256)",
   "event EscrowCreated(uint256 indexed escrowId, address indexed buyer, address indexed seller, uint256 amount, string description)",
 ];
 
-async function listItem(item: string, priceBTC: string, sellerAddress: string, description: string) {
-  const res = await fetch(`${SERVER_URL}/listings`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ item, price: priceBTC, sellerAddress, description }),
-  });
-  const data = await res.json();
-  if (!res.ok) {
-    console.error("ERROR:", data.error);
+// --- Nostr helpers ---
+
+function getSecretKey(): Uint8Array {
+  if (!PRIVATE_KEY) {
+    console.error("ERROR: PRIVATE_KEY must be set");
     process.exit(1);
   }
-  console.log(JSON.stringify({ success: true, listing: data }));
+  // ETH private keys are 32-byte hex, same curve as Nostr (secp256k1)
+  const raw = PRIVATE_KEY.startsWith("0x") ? PRIVATE_KEY.slice(2) : PRIVATE_KEY;
+  return hexToBytes(raw);
+}
+
+function getTag(event: any, name: string): string | undefined {
+  const tag = event.tags.find((t: string[]) => t[0] === name);
+  return tag ? tag[1] : undefined;
+}
+
+interface Listing {
+  id: string;
+  item: string;
+  price: string;
+  description: string;
+  status: string;
+  sellerAddress: string;
+  escrowId?: string;
+  buyerAddress?: string;
+  txHash?: string;
+  createdAt: number;
+  pubkey: string;
+}
+
+function parseListing(event: any): Listing {
+  return {
+    id: getTag(event, "d") || "",
+    item: getTag(event, "title") || "",
+    price: getTag(event, "price") || "0",
+    description: getTag(event, "description") || "",
+    status: getTag(event, "status") || "active",
+    sellerAddress: getTag(event, "seller_eth") || "",
+    escrowId: getTag(event, "escrow_id"),
+    buyerAddress: getTag(event, "buyer_eth"),
+    txHash: getTag(event, "tx_hash"),
+    createdAt: event.created_at,
+    pubkey: event.pubkey,
+  };
+}
+
+const pool = new SimplePool();
+
+async function publishToRelays(event: any): Promise<string[]> {
+  const results = await Promise.allSettled(pool.publish(RELAYS, event));
+  const published = RELAYS.filter((_, i) => results[i].status === "fulfilled");
+
+  if (published.length === 0) {
+    console.error("ERROR: Failed to publish to any relay");
+    results.forEach((r, i) => {
+      if (r.status === "rejected") console.error(`  ${RELAYS[i]}: ${r.reason}`);
+    });
+    process.exit(1);
+  }
+
+  return published;
+}
+
+async function queryListings(filter: Record<string, any>): Promise<any[]> {
+  const events = await pool.querySync(RELAYS, { kinds: [KIND_CLASSIFIED], "#t": [CLAWBAY_TAG], ...filter });
+
+  // For parameterized replaceable events, keep only the latest per `d` tag
+  const latest = new Map<string, any>();
+  for (const event of events) {
+    const d = getTag(event, "d") || "";
+    const existing = latest.get(d);
+    if (!existing || event.created_at > existing.created_at) {
+      latest.set(d, event);
+    }
+  }
+
+  return Array.from(latest.values());
+}
+
+// --- Actions ---
+
+async function listItem(item: string, priceBTC: string, sellerAddress: string, description: string) {
+  const sk = getSecretKey();
+  const id = crypto.randomUUID();
+
+  const tags: string[][] = [
+    ["d", id],
+    ["title", item],
+    ["price", priceBTC, "BTC"],
+    ["description", description],
+    ["status", "active"],
+    ["t", CLAWBAY_TAG],
+    ["seller_eth", sellerAddress],
+  ];
+
+  const event = finalizeEvent(
+    {
+      kind: KIND_CLASSIFIED,
+      created_at: Math.floor(Date.now() / 1000),
+      tags,
+      content: `${item} — ${priceBTC} BTC`,
+    },
+    sk
+  );
+
+  const published = await publishToRelays(event);
+
+  console.log(
+    JSON.stringify({
+      success: true,
+      listing: {
+        id,
+        item,
+        price: priceBTC,
+        sellerAddress,
+        description,
+        status: "active",
+      },
+      relays: published,
+    })
+  );
 }
 
 async function browse() {
-  const res = await fetch(`${SERVER_URL}/listings?status=active`);
-  const listings = await res.json();
+  const events = await queryListings({});
+  const listings = events.map(parseListing).filter((l) => l.status === "active");
 
   if (listings.length === 0) {
     console.log(JSON.stringify({ success: true, listings: [], message: "No active listings" }));
@@ -43,13 +166,15 @@ async function browse() {
 }
 
 async function details(listingId: string) {
-  const res = await fetch(`${SERVER_URL}/listings/${listingId}`);
-  if (!res.ok) {
+  const events = await queryListings({ "#d": [listingId] });
+
+  if (events.length === 0) {
     console.error("ERROR: Listing not found");
     process.exit(1);
   }
-  const data = await res.json();
-  console.log(JSON.stringify({ success: true, listing: data }));
+
+  const listing = parseListing(events[0]);
+  console.log(JSON.stringify({ success: true, listing }));
 }
 
 async function buyItem(listingId: string) {
@@ -58,13 +183,15 @@ async function buyItem(listingId: string) {
     process.exit(1);
   }
 
-  // Fetch listing
-  const listingRes = await fetch(`${SERVER_URL}/listings/${listingId}`);
-  if (!listingRes.ok) {
+  // Fetch listing from Nostr
+  const events = await queryListings({ "#d": [listingId] });
+  if (events.length === 0) {
     console.error("ERROR: Listing not found");
     process.exit(1);
   }
-  const listing = await listingRes.json();
+
+  const originalEvent = events[0];
+  const listing = parseListing(originalEvent);
 
   if (listing.status !== "active") {
     console.error("ERROR: Listing is not active (status: " + listing.status + ")");
@@ -86,87 +213,150 @@ async function buyItem(listingId: string) {
 
   // Parse escrow ID from event
   let escrowId = "unknown";
-  const event = receipt.logs.find((log: any) => {
+  const escrowEvent = receipt.logs.find((log: any) => {
     try {
       return contract.interface.parseLog({ topics: log.topics as string[], data: log.data })?.name === "EscrowCreated";
     } catch {
       return false;
     }
   });
-  if (event) {
-    const parsed = contract.interface.parseLog({ topics: event.topics as string[], data: event.data });
+  if (escrowEvent) {
+    const parsed = contract.interface.parseLog({ topics: escrowEvent.topics as string[], data: escrowEvent.data });
     escrowId = parsed?.args[0].toString() || "unknown";
   }
 
-  // Update listing status
-  await fetch(`${SERVER_URL}/listings/${listingId}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ status: "sold", escrowId, buyerAddress: wallet.address }),
-  });
+  // Republish listing as sold on Nostr
+  const sk = getSecretKey();
+  const tags: string[][] = [
+    ["d", listingId],
+    ["title", listing.item],
+    ["price", listing.price, "BTC"],
+    ["description", listing.description],
+    ["status", "sold"],
+    ["t", CLAWBAY_TAG],
+    ["seller_eth", listing.sellerAddress],
+    ["escrow_id", escrowId],
+    ["buyer_eth", wallet.address],
+    ["tx_hash", tx.hash],
+  ];
 
-  console.log(JSON.stringify({
-    success: true,
-    action: "bought",
-    listingId,
-    escrowId,
-    txHash: tx.hash,
-    buyer: wallet.address,
-    seller: listing.sellerAddress,
-    amount: listing.price,
-    item: listing.item,
-  }));
+  const updatedEvent = finalizeEvent(
+    {
+      kind: KIND_CLASSIFIED,
+      created_at: Math.floor(Date.now() / 1000),
+      tags,
+      content: `${listing.item} — SOLD`,
+    },
+    sk
+  );
+
+  await publishToRelays(updatedEvent);
+
+  console.log(
+    JSON.stringify({
+      success: true,
+      action: "bought",
+      listingId,
+      escrowId,
+      txHash: tx.hash,
+      buyer: wallet.address,
+      seller: listing.sellerAddress,
+      amount: listing.price,
+      item: listing.item,
+    })
+  );
 }
 
 async function cancelListing(listingId: string) {
-  const res = await fetch(`${SERVER_URL}/listings/${listingId}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ status: "cancelled" }),
-  });
-  if (!res.ok) {
-    console.error("ERROR: Failed to cancel listing");
+  const sk = getSecretKey();
+
+  // Fetch the existing listing
+  const events = await queryListings({ "#d": [listingId] });
+  if (events.length === 0) {
+    console.error("ERROR: Listing not found");
     process.exit(1);
   }
-  const data = await res.json();
-  console.log(JSON.stringify({ success: true, listing: data }));
+
+  const listing = parseListing(events[0]);
+
+  // Republish with cancelled status
+  const tags: string[][] = [
+    ["d", listingId],
+    ["title", listing.item],
+    ["price", listing.price, "BTC"],
+    ["description", listing.description],
+    ["status", "cancelled"],
+    ["t", CLAWBAY_TAG],
+    ["seller_eth", listing.sellerAddress],
+  ];
+
+  const event = finalizeEvent(
+    {
+      kind: KIND_CLASSIFIED,
+      created_at: Math.floor(Date.now() / 1000),
+      tags,
+      content: `${listing.item} — CANCELLED`,
+    },
+    sk
+  );
+
+  await publishToRelays(event);
+
+  console.log(
+    JSON.stringify({
+      success: true,
+      listing: { ...listing, status: "cancelled" },
+    })
+  );
 }
 
-const [, , action, ...args] = process.argv;
+// --- CLI ---
 
-switch (action) {
-  case "list":
-    if (args.length < 3) {
-      console.error("Usage: marketplace.ts list <item> <priceBTC> <sellerAddress> [description]");
-      process.exit(1);
+async function main() {
+  const [, , action, ...args] = process.argv;
+
+  try {
+    switch (action) {
+      case "list":
+        if (args.length < 3) {
+          console.error("Usage: marketplace.ts list <item> <priceBTC> <sellerAddress> [description]");
+          process.exit(1);
+        }
+        await listItem(args[0], args[1], args[2], args.slice(3).join(" ") || "");
+        break;
+      case "browse":
+        await browse();
+        break;
+      case "details":
+        if (!args[0]) {
+          console.error("Usage: marketplace.ts details <listingId>");
+          process.exit(1);
+        }
+        await details(args[0]);
+        break;
+      case "buy":
+        if (!args[0]) {
+          console.error("Usage: marketplace.ts buy <listingId>");
+          process.exit(1);
+        }
+        await buyItem(args[0]);
+        break;
+      case "cancel":
+        if (!args[0]) {
+          console.error("Usage: marketplace.ts cancel <listingId>");
+          process.exit(1);
+        }
+        await cancelListing(args[0]);
+        break;
+      default:
+        console.error("Usage: marketplace.ts <list|browse|details|buy|cancel> [args]");
+        process.exit(1);
     }
-    listItem(args[0], args[1], args[2], args.slice(3).join(" ") || "").catch(console.error);
-    break;
-  case "browse":
-    browse().catch(console.error);
-    break;
-  case "details":
-    if (!args[0]) {
-      console.error("Usage: marketplace.ts details <listingId>");
-      process.exit(1);
-    }
-    details(args[0]).catch(console.error);
-    break;
-  case "buy":
-    if (!args[0]) {
-      console.error("Usage: marketplace.ts buy <listingId>");
-      process.exit(1);
-    }
-    buyItem(args[0]).catch(console.error);
-    break;
-  case "cancel":
-    if (!args[0]) {
-      console.error("Usage: marketplace.ts cancel <listingId>");
-      process.exit(1);
-    }
-    cancelListing(args[0]).catch(console.error);
-    break;
-  default:
-    console.error("Usage: marketplace.ts <list|browse|details|buy|cancel> [args]");
+  } catch (err) {
+    console.error(err);
     process.exit(1);
+  }
+  process.exit(0);
 }
+
+main();

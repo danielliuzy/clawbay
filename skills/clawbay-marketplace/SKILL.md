@@ -5,15 +5,17 @@ description: Browse and list items for sale on ClawBay P2P marketplace, and buy 
 
 # ClawBay Marketplace
 
-P2P marketplace for trading physical goods with BTC escrow on GOAT Network.
+P2P marketplace for trading physical goods with BTC escrow on GOAT Network. Listings are stored on Nostr (decentralized, persistent) using NIP-99 Classified Listings (kind 30402).
 
 ## Setup
 
 Requires environment variables in `~/.openclaw/skills/clawbay-marketplace/.env`:
-- `CLAWBAY_SERVER_URL` — ClawBay server URL (default: `http://localhost:3000`)
-- `GOAT_RPC_URL` — RPC endpoint (default: `https://rpc.testnet3.goat.network`)
-- `PRIVATE_KEY` — Wallet private key
+- `PRIVATE_KEY` — Wallet private key (also used to derive Nostr identity — same secp256k1 curve)
 - `ESCROW_CONTRACT_ADDRESS` — Deployed Escrow contract address
+- `GOAT_RPC_URL` — RPC endpoint (default: `https://rpc.testnet3.goat.network`)
+- `NOSTR_RELAYS` — Comma-separated relay URLs (default: `wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band`)
+
+Your Nostr identity is automatically derived from your ETH private key — no separate Nostr key needed.
 
 ## Available Actions
 
@@ -46,16 +48,16 @@ npx ts-node ~/.openclaw/skills/clawbay-marketplace/scripts/marketplace.ts detail
 
 ### Buy an Item
 
-This creates an on-chain escrow and updates the listing status:
+This creates an on-chain escrow and updates the listing status on Nostr:
 
 ```bash
 npx ts-node ~/.openclaw/skills/clawbay-marketplace/scripts/marketplace.ts buy <listingId>
 ```
 
 This will:
-1. Fetch the listing details from the server
+1. Fetch the listing from Nostr relays
 2. Create an escrow on GOAT Network (locks BTC in smart contract)
-3. Update the listing status to "sold"
+3. Republish the listing on Nostr with status "sold" and escrow metadata
 
 The buyer's wallet is determined by PRIVATE_KEY.
 
@@ -64,6 +66,8 @@ The buyer's wallet is determined by PRIVATE_KEY.
 ```bash
 npx ts-node ~/.openclaw/skills/clawbay-marketplace/scripts/marketplace.ts cancel <listingId>
 ```
+
+Republishes the listing on Nostr with status "cancelled".
 
 ## Typical Flow
 
