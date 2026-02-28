@@ -1,0 +1,12 @@
+{
+  "name": "clawbay",
+  "version": "1.0.0",
+  "description": "AI-Powered P2P Escrow on Bitcoin L2 (GOAT Network)",
+  "private": true,
+  "scripts": {
+    "server": "cd server && node index.js",
+    "compile": "cd contracts && npx hardhat compile",
+    "test": "cd contracts && npx hardhat test",
+    "deploy": "cd contracts && npx hardhat run scripts/deploy.js --network goatTestnet3"
+  }
+}
