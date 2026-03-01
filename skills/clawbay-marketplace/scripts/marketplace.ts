@@ -1,14 +1,18 @@
-import { WebSocket } from "ws";
+import WebSocket from "ws";
 // @ts-ignore – polyfill for nostr-tools relay connections in Node.js
-globalThis.WebSocket = WebSocket as any;
+(globalThis as any).WebSocket = WebSocket;
 
+// @ts-ignore - nostr-tools subpath imports
 import { finalizeEvent } from "nostr-tools/pure";
+// @ts-ignore - nostr-tools subpath imports
 import { SimplePool } from "nostr-tools/pool";
-import { hexToBytes } from "@noble/hashes/utils";
+import { hexToBytes, bytesToHex } from "@noble/hashes/utils";
+import { sha256 } from "@noble/hashes/sha256";
 import { ethers } from "ethers";
 import * as crypto from "crypto";
 import * as dotenv from "dotenv";
 import * as path from "path";
+import * as fs from "fs";
 
 // Load .env from skill directory, then fall back to project root
 dotenv.config({ path: path.join(__dirname, "..", ".env") });
@@ -22,7 +26,9 @@ const DEFAULT_RELAYS = ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.no
 const RELAYS = process.env.NOSTR_RELAYS ? process.env.NOSTR_RELAYS.split(",").map((r) => r.trim()) : DEFAULT_RELAYS;
 
 const KIND_CLASSIFIED = 30402;
+const KIND_BLOSSOM_AUTH = 24242;
 const CLAWBAY_TAG = "clawbay";
+const BLOSSOM_SERVER = "https://blossom.nostr.build";
 
 const ESCROW_ABI = [
   "function createEscrow(address seller, string calldata description) external payable returns (uint256)",
@@ -56,6 +62,7 @@ interface Listing {
   escrowId?: string;
   buyerAddress?: string;
   txHash?: string;
+  image?: string;
   createdAt: number;
   pubkey: string;
 }
@@ -71,6 +78,7 @@ function parseListing(event: any): Listing {
     escrowId: getTag(event, "escrow_id"),
     buyerAddress: getTag(event, "buyer_eth"),
     txHash: getTag(event, "tx_hash"),
+    image: getTag(event, "image"),
     createdAt: event.created_at,
     pubkey: event.pubkey,
   };
@@ -84,13 +92,76 @@ async function publishToRelays(event: any): Promise<string[]> {
 
   if (published.length === 0) {
     console.error("ERROR: Failed to publish to any relay");
-    results.forEach((r, i) => {
+    results.forEach((r: PromiseSettledResult<any>, i: number) => {
       if (r.status === "rejected") console.error(`  ${RELAYS[i]}: ${r.reason}`);
     });
     process.exit(1);
   }
 
   return published;
+}
+
+async function uploadToBlossom(imagePath: string): Promise<string> {
+  console.error(`[INFO] Starting Blossom upload for: ${imagePath}`);
+  const sk = getSecretKey();
+
+  // Read the image file
+  if (!fs.existsSync(imagePath)) {
+    throw new Error(`Image file not found: ${imagePath}`);
+  }
+
+  const imageBuffer = fs.readFileSync(imagePath);
+  const imageBytes = new Uint8Array(imageBuffer);
+  const imageHash = bytesToHex(sha256(imageBytes));
+  console.error(`[INFO] Image size: ${imageBytes.length} bytes, SHA256: ${imageHash.slice(0, 16)}...`);
+
+  // Determine content type from extension
+  const ext = path.extname(imagePath).toLowerCase();
+  const contentTypes: Record<string, string> = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+  };
+  const contentType = contentTypes[ext] || "application/octet-stream";
+
+  // Create Blossom auth event (kind 24242)
+  const authEvent = finalizeEvent(
+    {
+      kind: KIND_BLOSSOM_AUTH,
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [
+        ["t", "upload"],
+        ["x", imageHash],
+        ["expiration", String(Math.floor(Date.now() / 1000) + 300)], // 5 min expiry
+      ],
+      content: "Upload image to Blossom",
+    },
+    sk
+  );
+
+  // Base64 encode the auth event for the header
+  const authHeader = "Nostr " + Buffer.from(JSON.stringify(authEvent)).toString("base64");
+
+  // Upload to Blossom
+  const response = await fetch(`${BLOSSOM_SERVER}/upload`, {
+    method: "PUT",
+    headers: {
+      "Content-Type": contentType,
+      "Authorization": authHeader,
+    },
+    body: imageBytes,
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Blossom upload failed (${response.status}): ${errorText}`);
+  }
+
+  const result = await response.json() as { url: string; sha256: string; size: number; type: string };
+
+  return result.url;
 }
 
 async function queryListings(filter: Record<string, any>): Promise<any[]> {
@@ -111,9 +182,14 @@ async function queryListings(filter: Record<string, any>): Promise<any[]> {
 
 // --- Actions ---
 
-async function listItem(item: string, priceBTC: string, sellerAddress: string, description: string) {
+async function listItem(item: string, priceBTC: string, sellerAddress: string, description: string, imagePath: string) {
   const sk = getSecretKey();
   const id = crypto.randomUUID();
+
+  // Upload image to Blossom (required)
+  console.error(`[INFO] Uploading image to Blossom...`);
+  const imageUrl = await uploadToBlossom(imagePath);
+  console.error(`[INFO] Image uploaded: ${imageUrl}`);
 
   const tags: string[][] = [
     ["d", id],
@@ -123,6 +199,7 @@ async function listItem(item: string, priceBTC: string, sellerAddress: string, d
     ["status", "active"],
     ["t", CLAWBAY_TAG],
     ["seller_eth", sellerAddress],
+    ["image", imageUrl],
   ];
 
   const event = finalizeEvent(
@@ -147,6 +224,7 @@ async function listItem(item: string, priceBTC: string, sellerAddress: string, d
         sellerAddress,
         description,
         status: "active",
+        image: imageUrl,
       },
       relays: published,
     })
@@ -240,6 +318,11 @@ async function buyItem(listingId: string) {
     ["tx_hash", tx.hash],
   ];
 
+  // Preserve image if present
+  if (listing.image) {
+    tags.push(["image", listing.image]);
+  }
+
   const updatedEvent = finalizeEvent(
     {
       kind: KIND_CLASSIFIED,
@@ -290,6 +373,11 @@ async function cancelListing(listingId: string) {
     ["seller_eth", listing.sellerAddress],
   ];
 
+  // Preserve image if present
+  if (listing.image) {
+    tags.push(["image", listing.image]);
+  }
+
   const event = finalizeEvent(
     {
       kind: KIND_CLASSIFIED,
@@ -312,17 +400,44 @@ async function cancelListing(listingId: string) {
 
 // --- CLI ---
 
+function parseArgs(args: string[]): { positional: string[]; flags: Record<string, string> } {
+  const positional: string[] = [];
+  const flags: Record<string, string> = {};
+
+  for (let i = 0; i < args.length; i++) {
+    if (args[i].startsWith("--")) {
+      const key = args[i].slice(2);
+      const value = args[i + 1] && !args[i + 1].startsWith("--") ? args[++i] : "true";
+      flags[key] = value;
+    } else {
+      positional.push(args[i]);
+    }
+  }
+
+  return { positional, flags };
+}
+
 async function main() {
-  const [, , action, ...args] = process.argv;
+  const [, , action, ...rawArgs] = process.argv;
+  const { positional: args, flags } = parseArgs(rawArgs);
+
+  // Debug logging
+  if (process.env.DEBUG) {
+    console.error(`[DEBUG] Action: ${action}`);
+    console.error(`[DEBUG] Args: ${JSON.stringify(args)}`);
+    console.error(`[DEBUG] Flags: ${JSON.stringify(flags)}`);
+  }
 
   try {
     switch (action) {
       case "list":
-        if (args.length < 3) {
-          console.error("Usage: marketplace.ts list <item> <priceBTC> <sellerAddress> [description]");
+        if (args.length < 3 || !flags.image) {
+          console.error("Usage: marketplace.ts list <item> <priceBTC> <sellerAddress> [description] --image /path/to/image");
+          console.error("ERROR: --image is required");
           process.exit(1);
         }
-        await listItem(args[0], args[1], args[2], args.slice(3).join(" ") || "");
+        console.error(`[INFO] Image provided: ${flags.image}`);
+        await listItem(args[0], args[1], args[2], args.slice(3).join(" ") || "", flags.image);
         break;
       case "browse":
         await browse();
