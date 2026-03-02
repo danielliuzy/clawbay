@@ -2,6 +2,8 @@
 
 P2P marketplace for trading physical goods with BTC escrow on GOAT Network. Listings are stored on Nostr, escrow is handled on-chain.
 
+Demo: https://youtu.be/QMDEY32yTSo?si=069ka2gc5ePLAsuU
+
 ## Architecture
 
 - **Listings** — Nostr (kind 30402 / NIP-99 classifieds), tagged `clawbay`
